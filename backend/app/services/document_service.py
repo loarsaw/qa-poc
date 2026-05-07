@@ -10,6 +10,17 @@ CHUNK_SIZE = 800      # characters per chunk
 CHUNK_OVERLAP = 100   # overlap between chunks
 
 
+def sanitize_text_for_db(text: str) -> str:
+    """Remove null bytes and other problematic characters for PostgreSQL UTF-8."""
+    if not text:
+        return ""
+    # Remove null bytes
+    text = text.replace('\x00', '')
+    # Remove other control characters except newlines, tabs, carriage returns
+    text = re.sub(r'[\x01-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+    return text
+
+
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
     """Split text into overlapping chunks."""
     if len(text) <= chunk_size:
@@ -37,9 +48,13 @@ def estimate_tokens(text: str) -> int:
 
 class DocumentService:
     async def create(self, db: AsyncSession, data: DocumentCreate) -> Document:
+        # Sanitize content before storing
+        sanitized_content = sanitize_text_for_db(data.content)
+        sanitized_title = sanitize_text_for_db(data.title)
+        
         doc = Document(
-            title=data.title,
-            content=data.content,
+            title=sanitized_title,
+            content=sanitized_content,
             source_type=data.source_type,
             metadata_=data.metadata or {},
         )
@@ -47,7 +62,7 @@ class DocumentService:
         await db.flush()  # get doc.id
 
         # Chunk and store
-        chunks = chunk_text(data.content)
+        chunks = chunk_text(sanitized_content)
         for i, chunk_text_val in enumerate(chunks):
             chunk = DocumentChunk(
                 document_id=doc.id,

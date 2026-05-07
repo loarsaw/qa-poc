@@ -5,7 +5,7 @@ from typing import Optional
 import os
 
 from app.db.database import get_db
-from app.models.models import Transcription, TranscriptionStatus, Document
+from app.models.models import Transcription, TranscriptionStatus
 from app.schemas.schemas import (
     TranscriptionResponse,
     TranscriptionListItem,
@@ -29,17 +29,23 @@ async def upload_and_transcribe(
     save_as_document: bool = Form(True),
     db: AsyncSession = Depends(get_db),
 ):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+
     if not transcription_service.is_supported(file.filename):
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type. Supported: mp3, mp4, wav, webm, ogg, flac, m4a, mov, avi, mkv",
+            detail=(
+                f"Unsupported file type '{file.filename}'. "
+                "Supported: mp3, mp4, m4a, wav, webm, ogg, flac, mpga, mov, avi, mkv"
+            ),
         )
 
     file_bytes = await file.read()
     if len(file_bytes) > MAX_SIZE:
         raise HTTPException(
             status_code=413,
-            detail=f"File too large. Max size: {settings.MAX_UPLOAD_SIZE_MB}MB",
+            detail=f"File too large. Max: {settings.MAX_UPLOAD_SIZE_MB} MB",
         )
 
     file_path = await transcription_service.save_upload(file_bytes, file.filename)
@@ -73,7 +79,6 @@ async def _run_transcription(
     language: Optional[str],
     save_as_document: bool,
 ):
-    """Background task: run Whisper, update DB, optionally create Document."""
     from app.db.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
@@ -90,36 +95,38 @@ async def _run_transcription(
         try:
             data = await transcription_service.transcribe(file_path, language=language)
 
-            transcription.status = TranscriptionStatus.COMPLETED
+            transcription.status         = TranscriptionStatus.COMPLETED
             transcription.transcript_text = data["text"]
-            transcription.language = data["language"]
+            transcription.language       = data["language"]
             transcription.duration_seconds = data["duration"]
-            transcription.segments = data["segments"]
-            transcription.whisper_model = data["model"]
+            transcription.segments       = data["segments"]
+            transcription.whisper_model  = data["model"]
 
             if save_as_document and data["text"]:
+                source = "audio" if "audio" in (transcription.mime_type or "") else "video"
                 doc = await document_service.create(
                     db,
                     DocumentCreate(
                         title=f"Transcript: {transcription.file_name}",
                         content=data["text"],
-                        source_type="audio" if "audio" in (transcription.mime_type or "") else "video",
+                        source_type=source,
                         metadata={
                             "transcription_id": transcription.id,
-                            "language": data["language"],
+                            "language":         data["language"],
                             "duration_seconds": data["duration"],
+                            "model":            data["model"],
                         },
                     ),
                 )
                 transcription.document_id = doc.id
 
         except Exception as e:
-            transcription.status = TranscriptionStatus.FAILED
+            transcription.status        = TranscriptionStatus.FAILED
             transcription.error_message = str(e)
         finally:
-            # Cleanup temp file
             try:
-                os.remove(file_path)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
             except Exception:
                 pass
 
@@ -133,28 +140,30 @@ async def list_transcriptions(
     status_filter: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Transcription)
+    query       = select(Transcription)
     count_query = select(func.count(Transcription.id))
 
     if status_filter:
         try:
             s = TranscriptionStatus(status_filter)
-            query = query.where(Transcription.status == s)
+            query       = query.where(Transcription.status == s)
             count_query = count_query.where(Transcription.status == s)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid status filter")
 
-    total = (await db.execute(count_query)).scalar()
+    total  = (await db.execute(count_query)).scalar()
     offset = (page - 1) * page_size
     result = await db.execute(
         query.order_by(desc(Transcription.created_at)).offset(offset).limit(page_size)
     )
+    items = [TranscriptionListItem.model_validate(t) for t in result.scalars().all()]
+
     return {
-        "items": result.scalars().all(),
-        "total": total,
-        "page": page,
+        "items":     items,
+        "total":     total,
+        "page":      page,
         "page_size": page_size,
-        "pages": max(1, -(-total // page_size)),
+        "pages":     max(1, -(-total // page_size)),
     }
 
 
@@ -163,10 +172,10 @@ async def get_transcription(transcription_id: str, db: AsyncSession = Depends(ge
     result = await db.execute(
         select(Transcription).where(Transcription.id == transcription_id)
     )
-    transcription = result.scalar_one_or_none()
-    if not transcription:
+    t = result.scalar_one_or_none()
+    if not t:
         raise HTTPException(status_code=404, detail="Transcription not found")
-    return transcription
+    return t
 
 
 @router.delete("/{transcription_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -174,8 +183,8 @@ async def delete_transcription(transcription_id: str, db: AsyncSession = Depends
     result = await db.execute(
         select(Transcription).where(Transcription.id == transcription_id)
     )
-    transcription = result.scalar_one_or_none()
-    if not transcription:
+    t = result.scalar_one_or_none()
+    if not t:
         raise HTTPException(status_code=404, detail="Transcription not found")
-    await db.delete(transcription)
+    await db.delete(t)
     await db.commit()

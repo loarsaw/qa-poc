@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
@@ -9,7 +9,6 @@ from app.schemas.schemas import (
     DocumentResponse,
     DocumentListItem,
     DocumentSearchRequest,
-    DocumentSearchResult,
     PaginatedResponse,
 )
 
@@ -22,7 +21,7 @@ async def create_document(
     db: AsyncSession = Depends(get_db),
 ):
     doc = await document_service.create(db, data)
-    return doc
+    return DocumentResponse.from_orm_safe(doc)
 
 
 @router.get("/", response_model=PaginatedResponse)
@@ -32,7 +31,11 @@ async def list_documents(
     source_type: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    return await document_service.list(db, page=page, page_size=page_size, source_type=source_type)
+    result = await document_service.list(
+        db, page=page, page_size=page_size, source_type=source_type
+    )
+    result["items"] = [DocumentListItem.model_validate(d) for d in result["items"]]
+    return result
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)
@@ -40,7 +43,7 @@ async def get_document(document_id: str, db: AsyncSession = Depends(get_db)):
     doc = await document_service.get(db, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    return doc
+    return DocumentResponse.from_orm_safe(doc)
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -60,11 +63,11 @@ async def search_documents(
     )
     return [
         {
-            "document_id": r["document"].id,
-            "title": r["document"].title,
-            "source_type": r["document"].source_type,
+            "document_id":     r["document"].id,
+            "title":           r["document"].title,
+            "source_type":     r["document"].source_type,
             "relevance_score": r["relevance_score"],
-            "matched_chunk": r["matched_chunk"],
+            "matched_chunk":   r["matched_chunk"],
         }
         for r in results
     ]

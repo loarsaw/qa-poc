@@ -21,10 +21,10 @@ services:
       context: ./backend
     ports:
       - "8000:8000"
+    env_file:
+      - ./backend/.env
     environment:
       - DATABASE_URL=postgresql+asyncpg://user:POSTGRES_PASSWORD@db:5432/qadb
-      - GOOGLE_API_KEY=
-      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
       - DEBUG=false
     volumes:
       - uploads:/tmp/uploads
@@ -32,6 +32,15 @@ services:
       db:
         condition: service_healthy
     restart: unless-stopped
+
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #   ports:
+  #     - "3000:3000"
+  #   depends_on:
+  #     - backend
+  #   restart: unless-stopped
 
 volumes:
   postgres_data:

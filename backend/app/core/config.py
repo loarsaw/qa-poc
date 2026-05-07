@@ -11,14 +11,13 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://user:POSTGRES_PASSWORD@db:5432/qadb"
 
-    # Google / Gemini
+    # Google / Gemini (chat)
     GOOGLE_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-1.5-flash"          # or gemini-1.5-pro
-    GEMINI_VISION_MODEL: str = "gemini-1.5-flash"
+    GEMINI_MODEL: str = "gemini-2.0-flash"
+    GEMINI_VISION_MODEL: str = "gemini-2.0-flash"
 
-    # Google Speech-to-Text (for audio transcription)
-    # Leave blank to fall back to Gemini multimodal transcription
-    GOOGLE_APPLICATION_CREDENTIALS: str = ""        # path to service-account JSON
+    DEEPGRAM_API_KEY: str = ""
+    DEEPGRAM_MODEL: str = "nova-3"
 
     # CORS
     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:5173"]

@@ -1,202 +1,183 @@
-"""
-Transcription service using Google Speech-to-Text v2 (async, long-running).
-Falls back to Gemini 1.5 multimodal for short files (< 1 min) if no
-service-account credentials are configured.
-"""
 import os
 import asyncio
-import mimetypes
+import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 import aiofiles
 
 from app.core.config import settings
 
-SUPPORTED_AUDIO = {".mp3", ".m4a", ".wav", ".webm", ".ogg", ".flac", ".mpga"}
-SUPPORTED_VIDEO = {".mp4", ".mpeg", ".webm", ".mov", ".avi", ".mkv"}
-ALL_SUPPORTED = SUPPORTED_AUDIO | SUPPORTED_VIDEO
+logger = logging.getLogger(__name__)
+
+SUPPORTED_AUDIO = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".webm", ".mpga"}
+SUPPORTED_VIDEO = {".mp4", ".mpeg", ".mov", ".avi", ".mkv"}
+ALL_SUPPORTED   = SUPPORTED_AUDIO | SUPPORTED_VIDEO
 
 MIME_MAP: Dict[str, str] = {
-    ".mp3":  "audio/mpeg",
-    ".mp4":  "video/mp4",
-    ".mpeg": "video/mpeg",
-    ".mpga": "audio/mpeg",
-    ".m4a":  "audio/mp4",
-    ".wav":  "audio/wav",
-    ".webm": "audio/webm",
-    ".ogg":  "audio/ogg",
-    ".flac": "audio/flac",
-    ".mov":  "video/quicktime",
-    ".avi":  "video/x-msvideo",
-    ".mkv":  "video/x-matroska",
+    ".mp3":  "audio/mpeg",  ".mp4":  "video/mp4",
+    ".mpeg": "video/mpeg",  ".mpga": "audio/mpeg",
+    ".m4a":  "audio/mp4",   ".wav":  "audio/wav",
+    ".webm": "audio/webm",  ".ogg":  "audio/ogg",
+    ".flac": "audio/flac",  ".mov":  "video/quicktime",
+    ".avi":  "video/x-msvideo", ".mkv": "video/x-matroska",
 }
 
-# Google Speech-to-Text encoding map (for WAV/FLAC direct-path)
-STT_ENCODING_MAP: Dict[str, str] = {
-    "audio/wav":   "LINEAR16",
-    "audio/flac":  "FLAC",
-    "audio/mpeg":  "MP3",
-    "audio/ogg":   "OGG_OPUS",
-    "audio/webm":  "WEBM_OPUS",
-}
+# -- Detect which SDK API is available ────────────────────────────────────────
+try:
+    from deepgram import AsyncDeepgramClient  # v4+
+    _HAS_ASYNC_CLIENT = True
+    logger.info("Deepgram SDK v4+ detected — using AsyncDeepgramClient")
+except ImportError:
+    _HAS_ASYNC_CLIENT = False
+    logger.info("Deepgram SDK v3 detected — using sync client via executor")
 
 
 class TranscriptionService:
     def __init__(self):
         os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-        self._use_stt = bool(settings.GOOGLE_APPLICATION_CREDENTIALS)
-
-    # ── helpers ──────────────────────────────────────────────────────────────
+        if not settings.DEEPGRAM_API_KEY:
+            logger.warning(
+                "DEEPGRAM_API_KEY is not set! "
+                "Free tier at https://console.deepgram.com"
+            )
 
     def is_supported(self, filename: str) -> bool:
-        return Path(filename).suffix.lower() in ALL_SUPPORTED
+        return bool(filename) and Path(filename).suffix.lower() in ALL_SUPPORTED
 
     def get_mime_type(self, filename: str) -> str:
         return MIME_MAP.get(Path(filename).suffix.lower(), "application/octet-stream")
 
     async def save_upload(self, file_bytes: bytes, filename: str) -> str:
-        safe_name = Path(filename).name
-        dest = os.path.join(settings.UPLOAD_DIR, safe_name)
+        if not self.is_supported(filename):
+            raise ValueError(f"Unsupported file type: {filename}")
+        if not file_bytes:
+            raise ValueError("Cannot save empty file")
+        dest = os.path.join(settings.UPLOAD_DIR, Path(filename).name)
         async with aiofiles.open(dest, "wb") as f:
             await f.write(file_bytes)
         return dest
 
-    # ── main entry point ─────────────────────────────────────────────────────
-
     async def transcribe(
         self, file_path: str, language: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Transcribe audio/video.
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        if not self.is_supported(file_path):
+            raise ValueError(f"Unsupported file type: {file_path}")
+        if os.path.getsize(file_path) == 0:
+            raise ValueError(f"File is empty: {file_path}")
 
-        Strategy:
-          1. If GOOGLE_APPLICATION_CREDENTIALS is set → Google Speech-to-Text v1
-          2. Otherwise → Gemini 1.5 Flash multimodal (supports audio up to ~8 h)
-        """
-        if self._use_stt:
-            return await self._transcribe_with_stt(file_path, language)
-        return await self._transcribe_with_gemini(file_path, language)
+        if _HAS_ASYNC_CLIENT:
+            return await self._transcribe_v4(file_path, language)
+        return await self._transcribe_v3(file_path, language)
 
-    # ── Google Speech-to-Text v1 ─────────────────────────────────────────────
-
-    async def _transcribe_with_stt(
+    # -- SDK v4 — AsyncDeepgramClient ─────────────────────────────────────────
+    async def _transcribe_v4(
         self, file_path: str, language: Optional[str]
     ) -> Dict[str, Any]:
-        from google.cloud import speech
+        from deepgram import AsyncDeepgramClient, PrerecordedOptions
 
-        mime = self.get_mime_type(file_path)
-        encoding_name = STT_ENCODING_MAP.get(mime)
+        client = AsyncDeepgramClient(api_key=settings.DEEPGRAM_API_KEY)
 
         async with aiofiles.open(file_path, "rb") as f:
             audio_bytes = await f.read()
 
-        # Build config
-        lang_code = language or "en-US"
-        config_kwargs: Dict[str, Any] = {
-            "language_code": lang_code,
-            "enable_automatic_punctuation": True,
-            "enable_word_time_offsets": True,
-            "model": "latest_long",
-        }
-        if encoding_name:
-            config_kwargs["encoding"] = getattr(
-                speech.RecognitionConfig.AudioEncoding, encoding_name
-            )
-        else:
-            # Let the API auto-detect
-            config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED
+        payload = {"buffer": audio_bytes, "mimetype": self.get_mime_type(file_path)}
+        options = PrerecordedOptions(
+            model=settings.DEEPGRAM_MODEL or "nova-3",
+            smart_format=True,
+            punctuate=True,
+            paragraphs=True,
+            utterances=True,
+            language=language or "en",
+        )
 
-        config = speech.RecognitionConfig(**config_kwargs)
-        audio = speech.RecognitionAudio(content=audio_bytes)
-        client = speech.SpeechClient()
+        response = await client.listen.asyncrest.v("1").transcribe_file(payload, options)
+        return self._parse_response(response, language)
+
+    # -- SDK v3 — sync DeepgramClient in executor ──────────────────────────────
+    async def _transcribe_v3(
+        self, file_path: str, language: Optional[str]
+    ) -> Dict[str, Any]:
+        from deepgram import DeepgramClient, PrerecordedOptions
+
+        async with aiofiles.open(file_path, "rb") as f:
+            audio_bytes = await f.read()
+
+        payload = {"buffer": audio_bytes, "mimetype": self.get_mime_type(file_path)}
+        options = PrerecordedOptions(
+            model=settings.DEEPGRAM_MODEL or "nova-3",
+            smart_format=True,
+            punctuate=True,
+            paragraphs=True,
+            utterances=True,
+            language=language or "en",
+        )
+
+        def _sync_call():
+            client = DeepgramClient(api_key=settings.DEEPGRAM_API_KEY)
+            return client.listen.prerecorded.v("1").transcribe_file(payload, options)
 
         loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, _sync_call)
+        return self._parse_response(response, language)
 
-        # Use long_running_recognize for files > ~1 min
-        if len(audio_bytes) > 1_000_000:
-            operation = await loop.run_in_executor(
-                None, lambda: client.long_running_recognize(config=config, audio=audio)
-            )
-            response = await loop.run_in_executor(None, operation.result)
-        else:
-            response = await loop.run_in_executor(
-                None, lambda: client.recognize(config=config, audio=audio)
-            )
-
-        segments: List[Dict] = []
-        full_text_parts: List[str] = []
+    def _parse_response(self, response: Any, language: Optional[str]) -> Dict[str, Any]:
+        transcript_text = ""
+        segments: List[Dict[str, Any]] = []
         duration = 0.0
+        detected_language = language or "en"
 
-        for i, result in enumerate(response.results):
-            alt = result.alternatives[0]
-            full_text_parts.append(alt.transcript)
-            seg: Dict[str, Any] = {
-                "id": i,
-                "text": alt.transcript,
-                "start": 0.0,
-                "end": 0.0,
-                "avg_logprob": None,
-            }
-            if alt.words:
-                start_s = alt.words[0].start_time.total_seconds()
-                end_s = alt.words[-1].end_time.total_seconds()
-                seg["start"] = start_s
-                seg["end"] = end_s
-                duration = max(duration, end_s)
-            segments.append(seg)
+        try:
+            channel = response.results.channels[0]
+            alt     = channel.alternatives[0]
+            transcript_text = alt.transcript or ""
+
+            try:
+                detected_language = channel.detected_language or detected_language
+            except AttributeError:
+                pass
+
+            if response.metadata and getattr(response.metadata, "duration", None):
+                duration = float(response.metadata.duration)
+
+            utterances = getattr(response.results, "utterances", None)
+            if utterances:
+                for i, utt in enumerate(utterances):
+                    segments.append({
+                        "id":          i,
+                        "text":        utt.transcript,
+                        "start":       float(utt.start),
+                        "end":         float(utt.end),
+                        "avg_logprob": getattr(utt, "confidence", None),
+                    })
+            else:
+                # Fallback: paragraph sentences
+                try:
+                    paras = alt.paragraphs.paragraphs
+                    idx = 0
+                    for para in paras:
+                        for sent in para.sentences:
+                            segments.append({
+                                "id":          idx,
+                                "text":        sent.text,
+                                "start":       float(sent.start),
+                                "end":         float(sent.end),
+                                "avg_logprob": None,
+                            })
+                            idx += 1
+                except (AttributeError, TypeError):
+                    pass
+
+        except (AttributeError, IndexError, TypeError) as e:
+            logger.warning("Could not fully parse Deepgram response: %s", e)
 
         return {
-            "text": " ".join(full_text_parts),
-            "language": lang_code,
+            "text":     transcript_text,
+            "language": detected_language,
             "duration": duration,
             "segments": segments,
-            "model": "google-speech-to-text-v1",
-        }
-
-    # ── Gemini multimodal transcription ──────────────────────────────────────
-
-    async def _transcribe_with_gemini(
-        self, file_path: str, language: Optional[str]
-    ) -> Dict[str, Any]:
-        import google.generativeai as genai
-        from google.generativeai.types import GenerationConfig
-
-        genai.configure(api_key=settings.GOOGLE_API_KEY)
-
-        async with aiofiles.open(file_path, "rb") as f:
-            audio_bytes = await f.read()
-
-        mime = self.get_mime_type(file_path)
-        lang_hint = f" The audio is in {language}." if language else ""
-
-        prompt = (
-            "Transcribe the following audio accurately."
-            f"{lang_hint} "
-            "Return ONLY the transcript text, with proper punctuation and paragraph breaks. "
-            "Do not add any commentary or explanation."
-        )
-
-        model = genai.GenerativeModel(
-            model_name=settings.GEMINI_VISION_MODEL,
-            generation_config=GenerationConfig(temperature=0.0, max_output_tokens=8192),
-        )
-
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: model.generate_content(
-                [{"mime_type": mime, "data": audio_bytes}, prompt]
-            ),
-        )
-
-        transcript = response.text.strip()
-
-        return {
-            "text": transcript,
-            "language": language or "unknown",
-            "duration": 0.0,        # Gemini doesn't return timestamps
-            "segments": [{"id": 0, "text": transcript, "start": 0.0, "end": 0.0}],
-            "model": f"gemini-multimodal/{settings.GEMINI_VISION_MODEL}",
+            "model":    f"deepgram-{settings.DEEPGRAM_MODEL or 'nova-3'}",
         }
 
 

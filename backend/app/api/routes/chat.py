@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
-from typing import List, Optional
+from sqlalchemy.orm import selectinload
+from typing import List
 import json
 
 from app.db.database import get_db
@@ -21,8 +22,44 @@ from app.services.document_service import document_service
 
 router = APIRouter()
 
+# Models that are NOT valid Gemini model names — remap them
+GEMINI_MODEL_FALLBACK = "gemini-flash-latest"
 
-# ─── Sessions ────────────────────────────────────────────────────────────────
+ALLOWED_MODELS = {
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-lite-preview-lite",
+    "gemini-flash-latest",
+    "gemini-flash-latest-8b",
+    "gemini-1.5-pro",
+}
+
+
+def _safe_model(model: str | None) -> str:
+    if not model:
+        return GEMINI_MODEL_FALLBACK
+    clean = model.removeprefix("models/")
+    if clean not in ALLOWED_MODELS:
+        return GEMINI_MODEL_FALLBACK
+    return clean
+
+
+
+async def _get_session_with_messages(db: AsyncSession, session_id: str) -> ChatSession | None:
+    result = await db.execute(
+        select(ChatSession)
+        .options(selectinload(ChatSession.messages))
+        .where(ChatSession.id == session_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_session_only(db: AsyncSession, session_id: str) -> ChatSession | None:
+    result = await db.execute(
+        select(ChatSession).where(ChatSession.id == session_id)
+    )
+    return result.scalar_one_or_none()
+
+
 
 @router.post("/sessions", response_model=ChatSessionResponse, status_code=status.HTTP_201_CREATED)
 async def create_session(
@@ -31,12 +68,12 @@ async def create_session(
 ):
     session = ChatSession(
         title=data.title,
-        model=data.model,
+        model=_safe_model(data.model),  # FIX: Sanitize model name here
         system_prompt=data.system_prompt,
     )
     db.add(session)
     await db.commit()
-    await db.refresh(session)
+    session = await _get_session_with_messages(db, session.id)
     return session
 
 
@@ -49,11 +86,17 @@ async def list_sessions(
     total = (await db.execute(select(func.count(ChatSession.id)))).scalar()
     offset = (page - 1) * page_size
     result = await db.execute(
-        select(ChatSession).order_by(desc(ChatSession.updated_at)).offset(offset).limit(page_size)
+        select(ChatSession)
+        .order_by(desc(ChatSession.updated_at))
+        .offset(offset)
+        .limit(page_size)
     )
     sessions = result.scalars().all()
+
+    items = [ChatSessionListItem.model_validate(s) for s in sessions]
+
     return {
-        "items": sessions,
+        "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -63,10 +106,7 @@ async def list_sessions(
 
 @router.get("/sessions/{session_id}", response_model=ChatSessionResponse)
 async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id)
-    )
-    session = result.scalar_one_or_none()
+    session = await _get_session_with_messages(db, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
@@ -74,15 +114,13 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_session(session_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
-    session = result.scalar_one_or_none()
+    session = await _get_session_only(db, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     await db.delete(session)
     await db.commit()
 
 
-# ─── Messages ────────────────────────────────────────────────────────────────
 
 @router.post("/sessions/{session_id}/messages", response_model=SendMessageResponse)
 async def send_message(
@@ -90,13 +128,10 @@ async def send_message(
     data: SendMessageRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    # Fetch session
-    result = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
-    session = result.scalar_one_or_none()
+    session = await _get_session_only(db, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Fetch history
     history_result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
@@ -105,16 +140,14 @@ async def send_message(
     )
     history = history_result.scalars().all()
 
-    # RAG context
-    context_docs = []
-    source_documents = []
+    context_docs: list = []
+    source_documents: list = []
     if data.use_rag:
         context_docs = await document_service.get_context_for_rag(
             db, data.content, document_ids=data.document_ids
         )
         source_documents = [{"content": d[:200]} for d in context_docs]
 
-    # Build message list for LLM
     llm_messages = llm_service.build_messages(
         history=[{"role": m.role, "content": m.content} for m in history]
         + [{"role": "user", "content": data.content}],
@@ -122,10 +155,10 @@ async def send_message(
         context_docs=context_docs or None,
     )
 
-    # Call LLM
-    response = await llm_service.chat(llm_messages, model=session.model)
+    # Sanitise model: never send an OpenAI model name to Gemini
+    gemini_model = _safe_model(session.model)
+    response = await llm_service.chat(llm_messages, model=gemini_model)
 
-    # Persist user message
     user_msg = ChatMessage(
         session_id=session_id,
         role="user",
@@ -134,7 +167,6 @@ async def send_message(
     )
     db.add(user_msg)
 
-    # Persist assistant message
     assistant_msg = ChatMessage(
         session_id=session_id,
         role="assistant",
@@ -147,7 +179,6 @@ async def send_message(
     )
     db.add(assistant_msg)
 
-    # Update session
     session.message_count = (session.message_count or 0) + 2
     if not session.title:
         session.title = data.content[:60]
@@ -165,8 +196,7 @@ async def stream_message(
     data: SendMessageRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
-    session = result.scalar_one_or_none()
+    session = await _get_session_only(db, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -178,7 +208,7 @@ async def stream_message(
     )
     history = history_result.scalars().all()
 
-    context_docs = []
+    context_docs: list = []
     if data.use_rag:
         context_docs = await document_service.get_context_for_rag(
             db, data.content, document_ids=data.document_ids
@@ -191,31 +221,39 @@ async def stream_message(
         context_docs=context_docs or None,
     )
 
+    gemini_model = _safe_model(session.model)
+
     async def event_generator():
         full_content = []
-        async for chunk in llm_service.stream_chat(llm_messages, model=session.model):
+        async for chunk in llm_service.stream_chat(llm_messages, model=gemini_model):
             full_content.append(chunk)
             yield f"data: {json.dumps({'delta': chunk})}\n\n"
 
-        # Persist after streaming
-        user_msg = ChatMessage(
-            session_id=session_id,
-            role="user",
-            content=data.content,
-            token_count=llm_service.count_tokens(data.content),
-        )
-        db.add(user_msg)
-        full_text = "".join(full_content)
-        assistant_msg = ChatMessage(
-            session_id=session_id,
-            role="assistant",
-            content=full_text,
-            token_count=llm_service.count_tokens(full_text),
-            model=session.model,
-        )
-        db.add(assistant_msg)
-        session.message_count = (session.message_count or 0) + 2
-        await db.commit()
+        from app.db.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as inner_db:
+            user_msg = ChatMessage(
+                session_id=session_id,
+                role="user",
+                content=data.content,
+                token_count=llm_service.count_tokens(data.content),
+            )
+            inner_db.add(user_msg)
+            full_text = "".join(full_content)
+            assistant_msg = ChatMessage(
+                session_id=session_id,
+                role="assistant",
+                content=full_text,
+                token_count=llm_service.count_tokens(full_text),
+                model=gemini_model,
+            )
+            inner_db.add(assistant_msg)
+            sess_result = await inner_db.execute(
+                select(ChatSession).where(ChatSession.id == session_id)
+            )
+            sess = sess_result.scalar_one_or_none()
+            if sess:
+                sess.message_count = (sess.message_count or 0) + 2
+            await inner_db.commit()
 
         yield f"data: {json.dumps({'done': True})}\n\n"
 
@@ -225,7 +263,7 @@ async def stream_message(
 @router.get("/sessions/{session_id}/messages", response_model=List[ChatMessageResponse])
 async def get_messages(
     session_id: str,
-    limit: int = 50,
+    limit: int = 100,
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(

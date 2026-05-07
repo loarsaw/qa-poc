@@ -1,197 +1,95 @@
 import time
 import asyncio
+import logging
 from typing import List, Dict, Optional, AsyncGenerator
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
-
+from google import genai
+from google.genai import types
 from app.core.config import settings
 
-# Configure Gemini once at import time
-genai.configure(api_key=settings.GOOGLE_API_KEY)
+logger = logging.getLogger(__name__)
 
-# Gemini roles differ from OpenAI: "user" and "model" (not "assistant")
-ROLE_MAP = {"user": "user", "assistant": "model", "system": "user"}
+if not settings.GOOGLE_API_KEY:
+    logger.error("GOOGLE_API_KEY is not set! Add it to backend/.env")
 
+_client = genai.Client(api_key=settings.GOOGLE_API_KEY)
 
-def _to_gemini_history(messages: List[Dict[str, str]]) -> tuple[str, list]:
-    """
-    Split a flat message list into:
-      - system_instruction (str): content of the first system message (if any)
-      - history (list[dict]): remaining messages in Gemini format
-    Gemini's ChatSession takes history as [{"role": "user"|"model", "parts": [text]}, ...]
-    The very last message is NOT included in history – it is sent via send_message().
-    """
-    system_instruction = ""
-    history = []
+DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
+OPENAI_MODELS = {"gpt-4o","gpt-4o-mini","gpt-4","gpt-4-turbo","gpt-3.5-turbo"}
 
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-        if role == "system":
-            # Gemini accepts system_instruction at model-init level;
-            # we concatenate multiples and inject as first user turn if needed.
-            system_instruction += content + "\n"
-        else:
-            history.append({"role": ROLE_MAP[role], "parts": [content]})
+def _normalise_model(name):
+    if not name: return DEFAULT_MODEL
+    clean = name.removeprefix("models/")
+    if clean in OPENAI_MODELS:
+        return DEFAULT_MODEL
+    return clean
 
-    return system_instruction.strip(), history
+ROLE_MAP = {"user":"user","assistant":"model","system":"user"}
 
+def _build_contents(messages):
+    return [types.Content(role=ROLE_MAP.get(m["role"],"user"),
+            parts=[types.Part.from_text(text=m["content"])]) for m in messages]
 
-def _count_tokens_approx(text: str) -> int:
-    """Approximate token count (Gemini charges ~4 chars/token)."""
+def _extract_system(messages):
+    sys_parts, rest = [], []
+    for m in messages:
+        (sys_parts if m["role"]=="system" else rest).append(m)
+    return "\n".join(p["content"] for p in sys_parts).strip(), rest
+
+def _count_tokens_approx(text):
     return max(1, len(text) // 4)
 
-
 class LLMService:
-    def __init__(self):
-        self.default_model = settings.GEMINI_MODEL
-        self._generation_config = GenerationConfig(
-            temperature=settings.TEMPERATURE,
-            max_output_tokens=settings.MAX_TOKENS,
-        )
-        # Permissive safety settings – tighten per your policy
-        self._safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
+    def count_tokens(self, text): return _count_tokens_approx(text)
 
-    def _make_model(self, model_name: Optional[str], system_instruction: str):
-        return genai.GenerativeModel(
-            model_name=model_name or self.default_model,
-            generation_config=self._generation_config,
-            safety_settings=self._safety_settings,
-            system_instruction=system_instruction or None,
-        )
-
-    def count_tokens(self, text: str) -> int:
-        return _count_tokens_approx(text)
-
-    def build_messages(
-        self,
-        history: List[Dict[str, str]],
-        system_prompt: Optional[str] = None,
-        context_docs: Optional[List[str]] = None,
-    ) -> List[Dict[str, str]]:
-        """
-        Returns a unified message list (OpenAI-style roles) that
-        _to_gemini_history() will convert.  The last element is always
-        the current user turn.
-        """
-        base_system = system_prompt or (
-            "You are a helpful AI assistant. Answer questions clearly and concisely. "
-            "If you don't know something, say so."
-        )
+    def build_messages(self, history, system_prompt=None, context_docs=None):
+        sys = system_prompt or "You are a helpful AI assistant. Answer clearly and concisely."
         if context_docs:
-            context_text = "\n\n---\n\n".join(context_docs)
-            base_system += (
-                f"\n\nUse the following context to answer the user's question:\n\n{context_text}"
-                "\n\nIf the answer is not found in the context, say so clearly."
-            )
+            sys += f"\n\nContext:\n\n" + "\n\n---\n\n".join(context_docs)
+        return [{"role":"system","content":sys}] + history
 
-        messages = [{"role": "system", "content": base_system}] + history
-        return messages
-
-    async def chat(
-        self,
-        messages: List[Dict[str, str]],
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-    ) -> Dict:
-        """Non-streaming Gemini chat. Returns content + metadata dict."""
-        system_instruction, history = _to_gemini_history(messages[:-1])
-        user_turn = messages[-1]["content"]
-
-        gen_cfg = GenerationConfig(
+    async def chat(self, messages, model=None, temperature=None, max_tokens=None):
+        model_id = _normalise_model(model)
+        sys_txt, rest = _extract_system(messages)
+        cfg = types.GenerateContentConfig(
             temperature=temperature if temperature is not None else settings.TEMPERATURE,
             max_output_tokens=max_tokens or settings.MAX_TOKENS,
+            system_instruction=sys_txt or None,
         )
-        gemini_model = genai.GenerativeModel(
-            model_name=model or self.default_model,
-            generation_config=gen_cfg,
-            safety_settings=self._safety_settings,
-            system_instruction=system_instruction or None,
-        )
-
-        chat_session = gemini_model.start_chat(history=history)
-
-        start = time.time()
-        # run_in_executor so we don't block the event loop (SDK is sync)
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None, lambda: chat_session.send_message(user_turn)
-        )
-        latency_ms = int((time.time() - start) * 1000)
-
-        content = response.text
+        start = time.time()
+        response = await loop.run_in_executor(None, lambda: _client.models.generate_content(
+            model=model_id, contents=_build_contents(rest), config=cfg))
+        latency_ms = int((time.time()-start)*1000)
+        content = response.text or ""
         token_count = _count_tokens_approx(content)
+        try: token_count = response.usage_metadata.candidates_token_count or token_count
+        except: pass
+        return {"content":content,"model":model_id,"finish_reason":"stop",
+                "token_count":token_count,"latency_ms":latency_ms}
 
-        # Gemini usage_metadata (available on response object)
-        try:
-            token_count = response.usage_metadata.candidates_token_count or token_count
-        except Exception:
-            pass
-
-        return {
-            "content": content,
-            "model": model or self.default_model,
-            "finish_reason": "stop",
-            "token_count": token_count,
-            "latency_ms": latency_ms,
-        }
-
-    async def stream_chat(
-        self,
-        messages: List[Dict[str, str]],
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-    ) -> AsyncGenerator[str, None]:
-        """Streaming Gemini chat – yields text deltas."""
-        system_instruction, history = _to_gemini_history(messages[:-1])
-        user_turn = messages[-1]["content"]
-
-        gen_cfg = GenerationConfig(
+    async def stream_chat(self, messages, model=None, temperature=None):
+        model_id = _normalise_model(model)
+        sys_txt, rest = _extract_system(messages)
+        cfg = types.GenerateContentConfig(
             temperature=temperature if temperature is not None else settings.TEMPERATURE,
             max_output_tokens=settings.MAX_TOKENS,
+            system_instruction=sys_txt or None,
         )
-        gemini_model = genai.GenerativeModel(
-            model_name=model or self.default_model,
-            generation_config=gen_cfg,
-            safety_settings=self._safety_settings,
-            system_instruction=system_instruction or None,
-        )
-
-        chat_session = gemini_model.start_chat(history=history)
-
         loop = asyncio.get_event_loop()
-
-        # The Gemini SDK's streaming is synchronous; run it in a thread and
-        # bridge each chunk to an async generator via a queue.
         queue: asyncio.Queue = asyncio.Queue()
         SENTINEL = object()
-
-        def _stream_sync():
+        def _sync():
             try:
-                response_stream = chat_session.send_message(user_turn, stream=True)
-                for chunk in response_stream:
-                    if chunk.text:
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk.text)
-            except Exception as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, SENTINEL)
-
-        loop.run_in_executor(None, _stream_sync)
-
+                for chunk in _client.models.generate_content_stream(
+                        model=model_id, contents=_build_contents(rest), config=cfg):
+                    if chunk.text: loop.call_soon_threadsafe(queue.put_nowait, chunk.text)
+            except Exception as e: loop.call_soon_threadsafe(queue.put_nowait, e)
+            finally: loop.call_soon_threadsafe(queue.put_nowait, SENTINEL)
+        loop.run_in_executor(None, _sync)
         while True:
             item = await queue.get()
-            if item is SENTINEL:
-                break
-            if isinstance(item, Exception):
-                raise item
+            if item is SENTINEL: break
+            if isinstance(item, Exception): raise item
             yield item
-
 
 llm_service = LLMService()

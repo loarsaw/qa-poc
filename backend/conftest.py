@@ -99,7 +99,7 @@ def mock_transcription_service():
             "language": "en-US",
             "duration": 5.0,
             "segments": [{"id": 0, "text": "Hello world", "start": 0.0, "end": 2.5}],
-            "model": "gemini-multimodal/gemini-1.5-flash",
+            "model": "gemini-multimodal/gemini-flash-latest",
         },
     ) as m:
         yield m
